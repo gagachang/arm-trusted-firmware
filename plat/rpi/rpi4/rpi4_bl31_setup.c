@@ -26,16 +26,6 @@
 
 #include <rpi_shared.h>
 
-/*
- * Fields at the beginning of armstub8.bin.
- * While building the BL31 image, we put the stub magic into the binary.
- * The GPU firmware detects this at boot time, clears that field as a
- * confirmation and puts the kernel and DT address in the following words.
- */
-extern uint32_t stub_magic;
-extern uint32_t dtb_ptr32;
-extern uint32_t kernel_entry32;
-
 static const gicv2_driver_data_t rpi4_gic_data = {
 	.gicd_base = RPI4_GIC_GICD_BASE,
 	.gicc_base = RPI4_GIC_GICC_BASE,
@@ -76,12 +66,8 @@ uintptr_t plat_get_ns_image_entrypoint(void)
 #ifdef PRELOADED_BL33_BASE
 	return PRELOADED_BL33_BASE;
 #else
-	/* Cleared by the GPU if kernel address is valid. */
-	if (stub_magic == 0)
-		return kernel_entry32;
-
-	WARN("Stub magic failure, using default kernel address 0x80000\n");
-	return 0x80000;
+	WARN("Using default kernel address 0x200000\n");
+	return 0x200000;
 #endif
 }
 
@@ -90,24 +76,9 @@ static uintptr_t rpi4_get_dtb_address(void)
 #ifdef RPI3_PRELOADED_DTB_BASE
 	return RPI3_PRELOADED_DTB_BASE;
 #else
-	/* Cleared by the GPU if DTB address is valid. */
-	if (stub_magic == 0)
-		return dtb_ptr32;
-
-	WARN("Stub magic failure, DTB address unknown\n");
-	return 0;
+	WARN("Using default DTB address\n");
+	return 0x26000000;
 #endif
-}
-
-static void ldelay(register_t delay)
-{
-	__asm__ volatile (
-		"1:\tcbz %0, 2f\n\t"
-		"sub %0, %0, #1\n\t"
-		"b 1b\n"
-		"2:"
-		: "=&r" (delay) : "0" (delay)
-	);
 }
 
 /*******************************************************************************
@@ -122,21 +93,43 @@ void bl31_early_platform_setup2(u_register_t arg0, u_register_t arg1,
 				u_register_t arg2, u_register_t arg3)
 
 {
-	/*
-	 * LOCAL_CONTROL:
-	 * Bit 9 clear: Increment by 1 (vs. 2).
-	 * Bit 8 clear: Timer source is 19.2MHz crystal (vs. APB).
-	 */
-	mmio_write_32(RPI4_LOCAL_CONTROL_BASE_ADDRESS, 0);
-
-	/* LOCAL_PRESCALER; divide-by (0x80000000 / register_val) == 1 */
-	mmio_write_32(RPI4_LOCAL_CONTROL_PRESCALER, 0x80000000);
-
-	/* Early GPU firmware revisions need a little break here. */
-	ldelay(100000);
-
 	/* Initialize the console to provide early debug support. */
 	rpi3_console_init();
+
+	/*
+	 * In debug builds, a special value is passed in 'arg1' to verify
+	 * platform parameters from BL2 to BL31. Not used in release builds.
+	 */
+	assert(arg1 == RPI3_BL31_PLAT_PARAM_VAL);
+
+	/* Check that params passed from BL2 are not NULL. */
+	bl_params_t *params_from_bl2 = (bl_params_t *) arg0;
+
+	assert(params_from_bl2 != NULL);
+	assert(params_from_bl2->h.type == PARAM_BL_PARAMS);
+	assert(params_from_bl2->h.version >= VERSION_2);
+
+	bl_params_node_t *bl_params = params_from_bl2->head;
+
+	/*
+	 * Copy BL33 and BL32 (if present), entry point information.
+	 * They are stored in Secure RAM, in BL2's address space.
+	 */
+	while (bl_params) {
+		if (bl_params->image_id == BL32_IMAGE_ID) {
+			bl32_image_ep_info = *bl_params->ep_info;
+		}
+
+		if (bl_params->image_id == BL33_IMAGE_ID) {
+			bl33_image_ep_info = *bl_params->ep_info;
+		}
+
+		bl_params = bl_params->next_params_info;
+	}
+
+	if (bl33_image_ep_info.pc == 0) {
+		panic();
+	}
 
 	bl33_image_ep_info.pc = plat_get_ns_image_entrypoint();
 	bl33_image_ep_info.spsr = rpi3_get_spsr_for_bl33_entry();
@@ -173,25 +166,6 @@ void bl31_early_platform_setup2(u_register_t arg0, u_register_t arg1,
 
 void bl31_plat_arch_setup(void)
 {
-	/*
-	 * Is the dtb_ptr32 pointer valid? If yes, map the DTB region.
-	 * We map the 2MB region the DTB start address lives in, plus
-	 * the next 2MB, to have enough room for expansion.
-	 */
-	if (stub_magic == 0) {
-		unsigned long long dtb_region = dtb_ptr32;
-
-		dtb_region &= ~0x1fffff;	/* Align to 2 MB. */
-		mmap_add_region(dtb_region, dtb_region, 4U << 20,
-				MT_MEMORY | MT_RW | MT_NS);
-	}
-	/*
-	 * Add the first page of memory, which holds the stub magic,
-	 * the kernel and the DT address.
-	 * This also holds the secondary CPU's entrypoints and mailboxes.
-	 */
-	mmap_add_region(0, 0, 4096, MT_NON_CACHEABLE | MT_RW | MT_SECURE);
-
 	rpi3_setup_page_tables(BL31_BASE, BL31_END - BL31_BASE,
 			       BL_CODE_BASE, BL_CODE_END,
 			       BL_RO_DATA_BASE, BL_RO_DATA_END
@@ -248,8 +222,10 @@ static void rpi4_prepare_dtb(void)
 	int ret, offs;
 
 	/* Return if no device tree is detected */
-	if (fdt_check_header(dtb) != 0)
+	if (fdt_check_header(dtb) != 0) {
+		ERROR("Can not find Device Tree\n");
 		return;
+	}
 
 	ret = fdt_open_into(dtb, dtb, 0x100000);
 	if (ret < 0) {
@@ -272,7 +248,10 @@ static void rpi4_prepare_dtb(void)
 	 * replace it with a region describing the whole of Trusted Firmware.
 	 */
 	remove_spintable_memreserve(dtb);
-	if (fdt_add_reserved_memory(dtb, "atf@0", 0, 0x80000))
+	if (fdt_add_reserved_memory(dtb, "atf@0", BL31_BASE, PLAT_MAX_BL31_SIZE))
+		WARN("Failed to add reserved memory nodes to DT.\n");
+
+	if (fdt_add_reserved_memory(dtb, "optee_os@0", BL32_BASE, BL32_SIZE))
 		WARN("Failed to add reserved memory nodes to DT.\n");
 
 	offs = fdt_node_offset_by_compatible(dtb, 0, "arm,gic-400");

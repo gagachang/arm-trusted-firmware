@@ -58,11 +58,44 @@
 #define CACHE_WRITEBACK_SHIFT		U(6)
 #define CACHE_WRITEBACK_GRANULE		(U(1) << CACHE_WRITEBACK_SHIFT)
 
+#define SEC_ROM_BASE			ULL(0x00000000)
+#define SEC_ROM_SIZE			ULL(0x00020000)
+
+/* FIP placed after ROM to append it to BL1 with very little padding. */
+#define PLAT_RPI3_FIP_BASE		ULL(0x00020000)
+#define PLAT_RPI3_FIP_MAX_SIZE		ULL(0x001E0000)
+
+/* We have 16M of memory reserved starting at 256M */
+#define SEC_SRAM_BASE			ULL(0x10000000)
+#define SEC_SRAM_SIZE			ULL(0x00100000)
+
+#define SEC_DRAM0_BASE			ULL(0x10100000)
+#define SEC_DRAM0_SIZE			ULL(0x00F00000)
+/* End of reserved memory */
+
+#define NS_DRAM0_BASE			ULL(0x11000000)
+#define NS_DRAM0_SIZE			ULL(0x01000000)
+
+/*
+ * BL33 entrypoint.
+ */
+#define PLAT_RPI3_NS_IMAGE_OFFSET	NS_DRAM0_BASE
+#define PLAT_RPI3_NS_IMAGE_MAX_SIZE	NS_DRAM0_SIZE
+
 /*
  * I/O registers.
  */
 #define DEVICE0_BASE			RPI_IO_BASE
 #define DEVICE0_SIZE			RPI_IO_SIZE
+
+/*
+ * Arm TF lives in SRAM, partition it here
+ */
+#define SHARED_RAM_BASE			SEC_SRAM_BASE
+#define SHARED_RAM_SIZE			ULL(0x00001000)
+
+#define BL_RAM_BASE			(SHARED_RAM_BASE + SHARED_RAM_SIZE)
+#define BL_RAM_SIZE			(SEC_SRAM_SIZE - SHARED_RAM_SIZE)
 
 /*
  * Mailbox to control the secondary cores. All secondary cores are held in a
@@ -77,8 +110,10 @@
  *
  *     sev();
  */
+#define PLAT_RPI3_TRUSTED_MAILBOX_BASE	SHARED_RAM_BASE//0x100
+
 /* The secure entry point to be used on warm reset by all CPUs. */
-#define PLAT_RPI3_TM_ENTRYPOINT		0x100
+#define PLAT_RPI3_TM_ENTRYPOINT		PLAT_RPI3_TRUSTED_MAILBOX_BASE
 #define PLAT_RPI3_TM_ENTRYPOINT_SIZE	ULL(8)
 
 /* Hold entries for each CPU. */
@@ -96,19 +131,78 @@
 #define PLAT_RPI3_TM_HOLD_STATE_BSP_OFF	ULL(2)
 
 /*
+ * BL1 specific defines.
+ *
+ * BL1 RW data is relocated from ROM to RAM at runtime so we need 2 sets of
+ * addresses.
+ *
+ * Put BL1 RW at the top of the Secure SRAM. BL1_RW_BASE is calculated using
+ * the current BL1 RW debug size plus a little space for growth.
+ */
+#define PLAT_MAX_BL1_RW_SIZE		ULL(0x10000)
+
+#define BL1_RO_BASE			SEC_ROM_BASE
+#define BL1_RO_LIMIT			(SEC_ROM_BASE + SEC_ROM_SIZE)
+#define BL1_RW_BASE			(BL1_RW_LIMIT - PLAT_MAX_BL1_RW_SIZE)
+#define BL1_RW_LIMIT			(BL_RAM_BASE + BL_RAM_SIZE)
+
+/*
+ * BL2 specific defines.
+ *
+ * Put BL2 just below BL31. BL2_BASE is calculated using the current BL2 debug
+ * size plus a little space for growth.
+ */
+#define PLAT_MAX_BL2_SIZE		ULL(0x2C000)
+
+#define BL2_BASE			(BL2_LIMIT - PLAT_MAX_BL2_SIZE)
+#define BL2_LIMIT			BL31_BASE
+
+/*
  * BL31 specific defines.
  *
  * Put BL31 at the top of the Trusted SRAM. BL31_BASE is calculated using the
  * current BL31 debug size plus a little space for growth.
  */
-#define PLAT_MAX_BL31_SIZE		ULL(0x80000)
+#define PLAT_MAX_BL31_SIZE		ULL(0x20000)
 
-#define BL31_BASE			ULL(0x1000)
-#define BL31_LIMIT			ULL(0x80000)
-#define BL31_PROGBITS_LIMIT		ULL(0x80000)
+#define BL31_BASE			(BL31_LIMIT - PLAT_MAX_BL31_SIZE)
+#define BL31_LIMIT			BL31_PROGBITS_LIMIT
+#define BL31_PROGBITS_LIMIT		(BL_RAM_BASE + BL_RAM_SIZE)
+
+/*
+ * BL32 specific defines.
+ *
+ * BL32 can execute from Secure SRAM or Secure DRAM.
+ */
+#define BL32_SRAM_BASE			BL_RAM_BASE
+#define BL32_SRAM_LIMIT			BL31_BASE
+#define BL32_DRAM_BASE			SEC_DRAM0_BASE
+#define BL32_DRAM_LIMIT			(SEC_DRAM0_BASE + SEC_DRAM0_SIZE)
+
+#ifdef SPD_opteed
+/* Load pageable part of OP-TEE at end of allocated DRAM space for BL32 */
+#define RPI3_OPTEE_PAGEABLE_LOAD_SIZE	0x080000 /* 512KB */
+#define RPI3_OPTEE_PAGEABLE_LOAD_BASE	(BL32_DRAM_LIMIT - \
+					 RPI3_OPTEE_PAGEABLE_LOAD_SIZE)
+#endif
 
 #define SEC_SRAM_ID			0
 #define SEC_DRAM_ID			1
+
+#if RPI3_BL32_RAM_LOCATION_ID == SEC_SRAM_ID
+# define BL32_MEM_BASE			BL_RAM_BASE
+# define BL32_MEM_SIZE			BL_RAM_SIZE
+# define BL32_BASE			BL32_SRAM_BASE
+# define BL32_LIMIT			BL32_SRAM_LIMIT
+#elif RPI3_BL32_RAM_LOCATION_ID == SEC_DRAM_ID
+# define BL32_MEM_BASE			SEC_DRAM0_BASE
+# define BL32_MEM_SIZE			SEC_DRAM0_SIZE
+# define BL32_BASE			BL32_DRAM_BASE
+# define BL32_LIMIT			BL32_DRAM_LIMIT
+#else
+# error "Unsupported RPI3_BL32_RAM_LOCATION_ID value"
+#endif
+#define BL32_SIZE			(BL32_LIMIT - BL32_BASE)
 
 /*
  * Other memory-related defines.
@@ -117,7 +211,7 @@
 #define PLAT_VIRT_ADDR_SPACE_SIZE	(ULL(1) << 32)
 
 #define MAX_MMAP_REGIONS		8
-#define MAX_XLAT_TABLES			4
+#define MAX_XLAT_TABLES			8
 
 #define MAX_IO_DEVICES			U(3)
 #define MAX_IO_HANDLES			U(4)
